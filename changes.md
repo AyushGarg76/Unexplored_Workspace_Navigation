@@ -541,3 +541,623 @@ in small increments (~±0.2-0.3 rad) rather than guessing large angles.
 ### README updated
 New "Camera pan/tilt" section with the command, joint order/units, and how
 to read back current position via `/locobot/joint_states`.
+<<<<<<< HEAD
+=======
+
+---
+
+## Step 9 — Deterministic navigation: map_server + amcl, supersedes Step 7 (2026-09-10/11)
+
+### Goal
+Step 7's `uan_localize.launch` (reusing rtabmap's own database) kept
+loading the wrong map in practice — whichever `rtabmap.db` happened to be
+on disk, which varied across sessions (fresh mapping runs, restored
+backups from the Step 6 stale-database incident, etc.). Needed a way to
+reliably load the *specific* saved map every time.
+
+### Design decision: standard map_server + amcl + move_base
+Went back to the ROS-standard approach considered and passed over in Step
+7: `map_server` republishes the exact `.pgm`/`.yaml` checked into the repo,
+`amcl` localizes against it using lidar scan + wheel odom, `move_base`
+plans/drives. Deterministic regardless of any rtabmap state, and drops the
+camera/RGBD dependency entirely — `amcl` doesn't need it.
+
+Bug found and fixed along the way: `my_room.yaml`'s `image:` field was a
+hardcoded **laptop** path (`/home/shubham/maps/my_room.pgm`) left over from
+wherever `map_saver` was run, which wouldn't resolve on the robot (`locobot`
+user, different home). Changed to a bare relative path (`my_room.pgm`) —
+`map_server` resolves relative image paths against the yaml's own directory.
+
+### Files created
+- **`uan_ws/src/uan_base_control/launch/uan_navigate.launch`** — base+lidar
+  bringup (no camera) + `map_server` (loading
+  `uan_ws/src/uan_base_control/maps/my_room.yaml`) + `amcl` + `move_base`
+  (reusing the same vendor costmap/planner config YAMLs as
+  `xslocobot_nav.launch`, since `move_base` isn't otherwise namespaced here).
+
+### Issue hit during testing: two launches running at once
+While debugging the "wrong map" symptom, found `uan_bringup.launch` and
+`uan_slam.launch` running simultaneously (from earlier, un-stopped
+sessions) — both bring up base/lidar/camera independently, risking
+duplicate/conflicting nodes. Not specific to this step, but worth a
+standing habit: `ps aux | grep -i roslaunch` before starting a new one.
+
+### amcl transform-extrapolation warnings — investigated, not a real fix needed
+Hit recurring `Failed to compute odom pose, skipping scan (...
+extrapolation ... into the future)` warnings. Tried adding
+`transform_tolerance` to `amcl` — **this did not help**; that param governs
+`amcl`'s own outgoing `map→odom` broadcast tolerance, not the internal
+scan-pose lookup that's actually failing, so it was the wrong lever
+(left in the launch file anyway since it's harmless, just ineffective for
+this).
+
+Actual assessment: scans arrive at 10Hz (confirmed from the rplidar
+driver's own startup log), and the warning recurs roughly every 1.3-1.6s —
+meaning only about 1 in every 13-16 scans is dropped, not most of them.
+Root cause is almost certainly the known Create3 ROS1↔ROS2 bridge latency
+jitter (documented since Step 4/5) occasionally landing a scan's timestamp
+a few ms ahead of the latest available tf. Low practical impact — `amcl`
+still updates from the large majority of scans. Decided not to chase this
+further unless it's shown to actually block navigation (a goal failing to
+plan/drive), rather than just being log noise.
+
+Separately noticed: `move_base`'s costmap plugins include a `depth_layer`
+subscribed to a `rtabmap/depth/...` topic that doesn't exist in this launch
+(no camera here) — harmless, just contributes nothing, an artifact of
+reusing the vendor's combined lidar+depth costmap config YAMLs as-is.
+
+### README updated
+"Traversing a saved map" section rewritten around `uan_navigate.launch`;
+`uan_localize.launch` marked superseded (kept in the repo, not deleted, but
+no longer the recommended path) with an explanation of why it was unreliable.
+rviz setup notes updated: `Map` display now points at global `/map` (not
+`/locobot/rtabmap/grid_map`), and rviz's click tools likely need **no**
+Tool Properties changes this time since `amcl`/`move_base` aren't
+namespaced under `/locobot` here — flagged to verify rather than assumed.
+
+### Not yet fully verified
+Whether `2D Pose Estimate`/`2D Nav Goal` actually work with rviz's default
+(unnamespaced) topics against this launch hasn't been confirmed hands-on —
+called out explicitly in the README rather than assumed.
+
+---
+
+## Step 10 — Laptop-only simulated navigation, no robot (2026-09-11)
+
+### Goal
+A new map (`hall.pgm`) was added, and the ask was to "load the robot model
+in simulation" and "trace the path" in rviz. Clarified with the user first:
+there's no Gazebo/physics simulator in this project, so "simulation" could
+mean either (a) a fully offline, no-hardware path-planning demo, or (b) the
+existing `uan_navigate.launch` pattern just pointed at `hall.yaml` and run
+on the real robot. User chose (a) — laptop-only, no locobot connection.
+
+### Bug found and fixed: hall.yaml
+`hall.yaml`'s `image:` field was `/home/shubham/maps/my_room.pgm` — wrong
+filename (leftover from copying the old yaml) **and** the same
+hardcoded-laptop-path bug fixed for `my_room.yaml` in Step 9. Corrected to
+the bare relative `hall.pgm`.
+
+### Design decision: standalone map_server + static TF + move_base, no interbotix packages
+Checked first (this session runs entirely on the laptop): neither
+`interbotix_xslocobot_nav` (the config package `uan_navigate.launch` reuses)
+nor `interbotix_xslocobot_descriptions` (needed for a `RobotModel` mesh) are
+installed outside the robot's own workspace — confirmed via `rospack find`,
+both fail. So this launch can't reuse the vendor costmap YAMLs or show the
+real robot mesh; both are written out as a deliberate simplification.
+
+Also confirmed the reverse: `uan_ws` isn't built on the laptop (no
+`devel`/`build`), so `roslaunch uan_base_control ...` wouldn't resolve the
+package at all. Solved by launching the file directly by path instead of by
+package name, and making `map_file` a required arg (no default) rather
+than hardcoding a path that would just be this laptop's again.
+
+### Iterated on the fake-position approach after live testing
+First attempt used `fake_localization` + a `rostopic pub` loop publishing a
+constant `/base_pose_ground_truth`, so `2D Pose Estimate` clicks would
+actually work. Tested it directly (this session has Bash access on the
+laptop) and it failed immediately: `rostopic` needs `python3-yaml`, not
+installed here, so the fake odom publisher process died on startup and
+`move_base` timed out waiting for a `map→odom` transform that never came.
+
+Replaced with two `tf2_ros static_transform_publisher` nodes
+(`map→odom→base_footprint`, both identity) — no extra dependency (already
+installed), fully deterministic. Trade-off: the fake robot's position is
+fixed (map-frame `(0,0)`, within `hall.yaml`'s bounds) rather than
+repositionable via `2D Pose Estimate` clicks. Accepted since the actual ask
+was "trace the path," not "test relocalization."
+
+### Files created
+- **`uan_ws/src/uan_base_control/launch/uan_sim_navigate.launch`** —
+  `map_server` (loading `map_file` arg) + 2 static transforms + `move_base`
+  with inline minimal costmap params (global: static + inflation layers;
+  local: inflation layer only, rolling window). `use_rviz` arg, default true.
+
+### Verification performed (directly, via Bash on the laptop)
+- Headless launch (`use_rviz:=false`): clean startup, map loaded at correct
+  dimensions (`212 X 417` matching `hall.pgm`), both costmaps initialize,
+  no errors, no crashed nodes. One harmless cosmetic warning fixed
+  (`static_map` param removed - redundant once `plugins` is set).
+- Sent a goal via `rostopic pub` to `/move_base_simple/goal` (map frame,
+  `(2.0, 2.0)`): `/move_base/status` reported status `1` ("goal accepted"),
+  and `/move_base/TrajectoryPlannerROS/global_plan` published a real path
+  (81 pose points). Confirms the full pipeline — map, TF, costmaps,
+  planner — actually works end to end, not just that nodes start.
+
+### README updated
+New "Simulated navigation (no robot, laptop-only)" section: what
+"simulation" means here (no Gazebo), the launch-by-path command, rviz
+displays to add (`Map` on `/map`, `Path` on
+`/move_base/TrajectoryPlannerROS/global_plan`), and the fixed-start-position
+caveat with how to change it.
+
+---
+
+## Step 11 — Adding the real robot mesh to the sim launch (2026-09-11)
+
+### Goal
+Step 10's `uan_sim_navigate.launch` had no `RobotModel` — no
+`interbotix_xslocobot_descriptions` was available anywhere outside the
+robot's own workspace. User copied that package into `reference/` and
+asked to wire it in.
+
+### Two bugs found and fixed while testing live (this session has Bash
+access on the laptop, so each of these was actually reproduced and
+confirmed fixed, not just reasoned about)
+
+**1. `$(eval ...)` can't be nested inline inside another `$(...)`
+substitution.** First attempt put
+`arm_model:=$(eval 'mobile_' + arg('robot_model').split('_')[1])` directly
+inside the `command="xacro ..."` string alongside `$(find ...)`/`$(arg ...)`
+substitutions. roslaunch rejected it: `Invalid left parenthesis '(' in
+substitution args`. Fixed by extracting it into its own `<arg
+name="arm_model" default="$(eval ...)"/>` first (matching how the vendor's
+own `xslocobot_description.launch` does exactly this), then referencing
+the plain `$(arg arm_model)` inside the command string.
+
+**2. conda shadows `python3`, breaking every pure-Python ROS node.**
+`joint_state_publisher` died on startup with the same
+`ModuleNotFoundError: No module named 'yaml'` seen for `rostopic` in Step
+10 - except this time it couldn't be dodged with a workaround, since a
+real robot mesh needs `joint_state_publisher` to actually publish
+`/joint_states`. Root cause confirmed directly: `which python3` inside
+this session's shell resolves to `~/miniconda3/bin/python3` (the `(base)`
+conda env visible in every prompt this whole session), which has no
+`yaml` module, while `/usr/bin/python3 -c "import yaml"` works fine -
+`dpkg` even shows `python3-yaml` installed, just not for conda's
+interpreter. This is the same class of issue the user's own README
+`## to use the ssh` section already flags with `conda deactivate` for the
+SSH-to-locobot case; it turns out to apply to plain local laptop ROS work
+too. Fixed for testing by stripping `~/miniconda3/{bin,condabin}` from
+`PATH`; documented in the README as `conda deactivate` before sourcing ROS.
+
+### Design decision: resolve irobot_create_description via directory, not by installing/building anything
+The Create3 base's own visual meshes (`body_visual.dae`, `bumper_visual.dae`,
+etc.) live in a separate package, `irobot_create_description`, referenced
+via `package://` URIs inside `locobot_create3.urdf.xacro` - not included in
+what got copied to `reference/`. Not installed as a ROS1/Noetic apt package
+either. It **was** already present as a ROS2 Galactic `.deb`
+(`ros-galactic-irobot-create-description`) from earlier bridge setup work.
+
+Confirmed directly that ROS1's `rospack`/`resource_retriever` resolve it
+correctly just from `/opt/ros/galactic/share` being on `ROS_PACKAGE_PATH` -
+no ROS2 sourcing, no distro mixing, since `rospack` only cares about
+finding a `package.xml` per directory, not which ROS version installed it.
+Avoided the heavier alternatives (installing a ROS1 build of
+`irobot_create_description` from source, or building a whole new catkin
+workspace) since this one-directory addition already fully worked.
+
+### Files changed
+- **`uan_ws/src/uan_base_control/launch/uan_sim_navigate.launch`** — added
+  `robot_description` param (xacro command against
+  `interbotix_xslocobot_descriptions/urdf/locobot.urdf.xacro`),
+  `joint_state_publisher` and `robot_state_publisher` nodes. Renamed the
+  static transforms and move_base's frame params from bare `odom`/
+  `base_footprint` to `locobot/odom`/`locobot/base_footprint` to match the
+  URDF's baked-in `robot_name` prefix (the two would otherwise be
+  disconnected TF trees).
+
+### Verification performed (all directly, via Bash on the laptop)
+- `xacro` generation of `locobot.urdf.xacro` (arm_model=mobile_wx200,
+  base_model=create3) succeeds cleanly; `check_urdf` on the output shows a
+  complete, correctly-nested link tree (`locobot/base_footprint` down
+  through the arm, gripper, wheels, etc.).
+- Headless launch: all 6 nodes (`map_server`, both static transforms,
+  `move_base`, `joint_state_publisher`, `robot_state_publisher`) start and
+  stay alive - no crashes, no errors beyond the pre-existing harmless
+  `meter_scoring` cosmetic warning.
+- `rosrun tf tf_echo map locobot/base_link` resolves cleanly (identity
+  transform) - confirms the full TF chain connects: `map` → my static
+  transforms → the URDF's own internal tree. Not two disconnected trees.
+- `/joint_states` is actively publishing (non-zero, incrementing `seq`).
+
+Mesh *rendering* itself wasn't visually confirmed (no display available in
+this session) - only that every prerequisite for it (`robot_description`
+valid, TF connected, `package://` paths resolvable) checks out.
+
+### README updated
+"Simulated navigation" section rewritten: added the `RobotModel` display
+instruction, and a new "Two known machine-specific gotchas" block
+up-front (conda/python3-yaml, the two required `ROS_PACKAGE_PATH`
+entries) - both are the kind of silent, non-obvious failure worth
+front-loading rather than letting someone rediscover them. Also fixed a
+`~` vs `$HOME` shell-expansion mistake from earlier in this session's own
+example command (`~` only expands at the very start of a shell word, not
+after `map_file:=`).
+
+---
+
+## Step 12 — Actually driving the fake robot to a goal (2026-09-11)
+
+### Goal
+After Step 11 added the robot mesh, `2D Nav Goal` clicks still didn't move
+anything — by design, `odom_to_base_footprint` was a **static** transform,
+so `move_base` could plan and publish a path but nothing consumed its
+`/cmd_vel` output to actually move the mesh. User wanted to see it drive.
+
+### Design decision: a small dead-reckoning integrator, not a real physics sim
+Added `fake_base_sim.py`: subscribes to `/cmd_vel`, integrates linear/
+angular velocity into a pose at 20 Hz, and broadcasts that as the
+`locobot/odom → locobot/base_footprint` transform (replacing the static
+one from Step 10/11 — `map → locobot/odom` stays static, no localization
+drift being simulated). No collision checking - it'll drive straight
+through mapped walls if told to, same as any pure dead-reckoning sim
+without a real robot/physics engine underneath. Explicitly out of scope:
+this is for tracing/demoing a path, not testing collision avoidance.
+
+Considered and rejected: pulling in a real 2D physics/robot simulator
+(stdr_simulator, stage_ros) for actual collision-aware simulation - bigger
+dependency and setup for a want that was "make it move to show the path,"
+not "simulate physical interaction with the map."
+
+### Files changed
+- **`uan_ws/src/uan_base_control/scripts/fake_base_sim.py`** (new) — the
+  integrator described above. Plain `rospy`/`tf2_ros`, no new dependency.
+- **`uan_ws/src/uan_base_control/launch/uan_sim_navigate.launch`** —
+  replaced the static `odom_to_base_footprint` node with `fake_base_sim`.
+  Since this launch runs without `uan_ws` built (Step 10's design), also
+  needed `uan_ws/src` added to the required `ROS_PACKAGE_PATH` list so
+  `$(find uan_base_control)` resolves — no `catkin_make` needed for a pure
+  Python script, just `rospack` being able to find the package directory.
+- **`uan_ws/src/uan_base_control/CMakeLists.txt`** / **`package.xml`** —
+  registered the new script for the real robot's catkin build too
+  (`catkin_install_python`, `tf2_ros` exec_depend).
+
+### Verification performed (directly, via Bash on the laptop)
+- Checked `locobot/odom → locobot/base_footprint` before sending a goal:
+  `(0, 0, 0)`.
+- Sent a goal at map `(2.0, 2.0)`, waited 5s.
+- Re-checked the same transform: `(2.006, 1.899, 0)` — the fake robot
+  actually drove to within a few cm of the goal, not just computed a path.
+- No errors, no crashed nodes.
+
+### README updated
+"Simulated navigation" section: goal-driving now described accurately
+(robot moves, not just a static path line), no-collision-checking caveat
+added, and the stale "fixed robot" / "nothing physically moves" language
+from Step 10 removed.
+
+---
+
+## Step 13 — Plan: 3D mapping with the depth camera (2026-09-15)
+
+### Goal
+Build a 3D map of the workspace with the RealSense, the way Step 3 built a 2D
+map with the lidar. **This step is planning only — no code or config changed.**
+
+### Platform facts established
+
+| Item | Value |
+| --- | --- |
+| Camera | RealSense **D435** (vendor `interbotix_ros_xslocobots/README.md:29`) |
+| Camera connected now? | **No** — no `8086:*` USB device, no `/dev/video*`. (`8087:0026` is Intel Bluetooth, not the camera) |
+| Lidar connected now? | **No** — `/dev/rplidar` absent; `/dev/ttyUSB0` is the U2D2 (FTDI `0403:6014`) |
+| USB 3 available | Yes — buses 2 and 4 are 10000M root hubs |
+| rtabmap | `0.21.10`, linked against **liboctomap 1.9**, GTSAM, g2o, `pcl_io_ply` |
+| rtabmap 3D outputs | `octomap_full`, `octomap_binary` topics; `rtabmap-export`, `rtabmap-databaseViewer` CLI tools installed |
+| `octomap_server` | not installed (not required — rtabmap builds the OctoMap itself) |
+| realsense2_camera | `2.3.2`, librealsense `2.50.0` |
+| NUC compute | 12 threads, 15 GiB RAM, Intel iGPU only (**no CUDA**) |
+
+### Key finding 1: 3D data already exists from the lidar runs
+`uan_slam.launch` wraps `xslocobot_nav.launch`, which hardcodes
+`use_camera:=true`. So every lidar SLAM run also recorded RGB-D frames.
+`rtabmap-info ~/.ros/rtabmap.db` (last written 2026-09-12):
+
+- 2 sessions, 208 nodes, 15.6 m of odometry, 208 s
+- **Depth images 46 MB, RGB images 10 MB** stored
+
+A 3D point cloud can be regenerated from those stored depth images with
+`rtabmap-export` today, with no robot or camera attached.
+
+### Key finding 2: the current SLAM config makes the *live* 3D map flat
+The same DB shows `Grid/Sensor = 0` (laser). In rtabmap 0.21.10
+`Grid/Sensor` is `0=laser, 1=depth, 2=both`, and the vendor's
+`--Grid/FromDepth false` is the legacy spelling of `Grid/Sensor 0`. rtabmap
+builds its OctoMap from each node's local grid, so under this config the live
+OctoMap/cloud is only a slice at lidar height. The depth images are stored but
+not used for the map. **3D mapping needs `Grid/Sensor 2`.**
+
+### Key finding 3: `rtabmap_args` cannot override the vendor flags
+In `xslocobot_nav.launch` the user's `rtabmap_args` is placed **before** the
+hardcoded flags (`default="$(arg rtabmap_args) --RGBD/... --Grid/FromDepth false ..."`).
+A later flag on the command line wins, so passing `--Grid/Sensor 2` through
+`rtabmap_args` would be overridden. The fix is to override the whole
+`rtabmap_default_args` arg from our include. That arg has a `default=`, so an
+including launch file can set it.
+
+### Plan
+
+**Phase 0 — Export 3D from the existing DB (no hardware)**
+1. Back up `~/.ros/rtabmap.db` first. Every SLAM run appends to or rewrites it;
+   that is how it ended up with 2 sessions, and how Step 9's
+   wrong-map problem started.
+2. `rtabmap-export --cloud --voxel 0.02 --max_range 4 <db>` to get a `.ply`.
+3. View it in `rtabmap-databaseViewer` or in CloudCompare/MeshLab on the laptop.
+4. Pass: a recognisable room with walls at their real height.
+   Watch for: the 2 sessions may not be linked (WM holds 118 of 208 nodes),
+   so the export could show only part of the room or two overlapping copies.
+
+**Phase 1 — Camera hardware bring-up**
+1. Plug the D435 into a USB-3 port with a USB-3 cable.
+2. `lsusb` should show `8086:0b07`, and `lsusb -t` should show it at 5000M.
+   At 480M it has fallen back to USB 2, which leads to dropped frames and
+   `align_depth` failures.
+3. `roslaunch uan_base_control uan_bringup.launch use_camera:=true`, then
+   `rostopic hz` on `/locobot/camera/color/image_raw` and
+   `/locobot/camera/aligned_depth_to_color/image_raw` should both read about 30 Hz.
+
+**Phase 2 — `uan_slam_3d.launch`** (new file, `uan_slam.launch` left untouched)
+- Wrap `xslocobot_nav.launch` and override the full `rtabmap_default_args`.
+- Keep lidar ICP registration (`Reg/Strategy 1`, `Reg/Force3DoF true`) for pose.
+- Set `Grid/Sensor 2` and `Grid/3D true` so the map uses depth as well.
+- Set `Grid/RangeMax 4.0` (D435 depth noise grows with the square of range) and
+  `Grid/CellSize 0.05`.
+- Give each map its own `database_path` (e.g. `~/uan_maps/<name>.db`) and
+  start with a clean database, never `~/.ros/rtabmap.db`.
+- Expose `camera_tilt_angle`. The vendor default of 0.2618 rad (15° down) is
+  suited to obstacles, but a 3D map needs the walls, so try about 0–0.1 rad.
+- Keep a `use_lidar:=false` depth-only fallback. It switches to visual
+  registration, which is weaker in plain, textureless rooms.
+
+**Phase 3 — Mapping run procedure**
+- Drive slower than for 2D mapping: at most 0.1 m/s and 0.3 rad/s. The
+  teleop limits (0.30 / 1.00) are fast enough to blur RGB-D frames.
+- Close loops by returning to the start. At each stop, sweep pan/tilt (Step 8).
+- On the laptop, watch only light topics: `octomap_occupied_space`, or
+  `cloud_map` at low rate. Never subscribe to the raw camera images over WiFi:
+  640×480 colour plus depth at 30 Hz is tens of MB/s.
+
+**Phase 4 — Export and save**
+- `rtabmap-export`: a `.ply` point cloud, plus an optional textured mesh.
+- OctoMap `.bt`: save via `rtabmap-databaseViewer`, or install
+  `octomap_server` to use `octomap_saver`. Which of these to use is still open.
+- Output sizes: 3D clouds and DBs run from tens to hundreds of MB, and GitHub
+  rejects files over 100 MB. `.gitignore` currently has no rules for `*.db`,
+  `*.ply`, `*.pcd` or `*.bt`. The user deliberately stopped ignoring
+  `maps/` and `*.pgm`, so adding rules for 3D files is a decision for the user.
+
+**Phase 5 — Use the map (toward the project goal)**
+- Localization on the saved 3D DB (`localization:=true`).
+- An OctoMap stores free, occupied and **unknown** voxels, and unknown space is
+  exactly what frontier-based exploration of unexplored areas needs.
+
+### Current blockers
+Camera and lidar are both unplugged. Phase 0 is the only phase that can run
+right now.
+
+---
+
+## Step 14 — 3D mapping pipeline built: export tools + `uan_slam_3d.launch` (2026-09-15)
+
+### Goal
+Carry out the Step 13 plan as far as possible without hardware: Phase 0
+(export the existing DB) and Phase 2 (the 3D SLAM launch), plus the export
+tooling Phase 4 needs. Camera and lidar are still unplugged, so Phases 1 and 3
+are not done.
+
+### Correction to Step 13
+Step 13 warned the export could be partial because "the 2 sessions may not be
+linked (WM holds 118 of 208 nodes)". Querying the DB's `Node` table showed
+that is **not** the cause:
+
+| map_id | nodes | note |
+| --- | --- | --- |
+| 0 | 206 (117 normal + 89 intermediate) | the real Sep 12 run |
+| 1 | 2 (1 + 1) | a stub session a day later, negligible |
+
+There are 0 links between sessions, but session 1 holds almost nothing. The
+117-pose export happens because **`rtabmap-export` skips intermediate nodes
+(weight -1)**, even though all 208 nodes store depth, RGB and scan data. So
+about 43% of stored depth frames never reach the cloud. The cloud still covers
+the whole run, so this was not pursued further. It is noted in the export
+script header.
+
+### Phase 0 — done: 3D cloud from the existing database
+1. Backed up `~/.ros/rtabmap.db` to
+   `~/uan_maps/backups/rtabmap_2026-09-12_lidar_slam.db`; `cmp` confirmed it is
+   identical.
+2. Exported with the real flags, checked in `rtabmap-export --help` rather than
+   trusted from memory: `--cloud --poses --decimation 4 --voxel 0.02 --max_range 4`.
+3. Result: 856,593 raw points, **546,345 after 2 cm voxel filtering**, a 17 MB
+   `.ply` file, 1.6 s, 277 MB peak RAM.
+
+Parsed height distribution: the cloud is **really 3D**, with the floor at
+z≈0 and walls rising to 1.5–1.8 m, over about 4 m × 12 m. **Nothing is above
+about 1.8 m**, which fits the vendor's 15° down camera tilt with a 4 m range.
+This supports raising the tilt.
+
+`cmp` after export: `rtabmap-export` does **not** modify the database it
+reads. The export script still uses a temp copy, so it is safe even on a
+database that rtabmap has open.
+
+### New finding: the vendor flags also truncate the 3D map at 0.7 m
+The vendor lidar branch sets `Grid/MaxObstacleHeight 0.7`. rtabmap drops
+points above that height when it builds the grid, and the OctoMap is built
+from that grid. So even with `Grid/Sensor 2`, the live 3D map would stop at
+0.7 m. This is fixed in the new launch.
+
+### Files created
+- **`launch/uan_slam_3d.launch`**: wraps `xslocobot_nav.launch` and replaces the
+  whole `rtabmap_default_args` (for the reason, see Step 13 key finding 3).
+  Relative to the vendor lidar branch it changes:
+  - `Grid/FromDepth false` → `Grid/Sensor 2`, and adds `Grid/3D true`
+  - `Grid/MaxObstacleHeight 0.7` → `2.0` (arg `max_obstacle_height`)
+  - `Grid/RangeMax 0` → `4.0` (arg `grid_range_max`). **Tradeoff:** this also
+    limits the lidar's reach in the 2D grid, so it may need raising in long halls.
+  - Adds `--delete_db_on_start` when `fresh_db:=true` (the default) and
+    `localization:=false`.
+  - Per-map DB at `$HOME/uan_maps/<map_name>.db` instead of `~/.ros/rtabmap.db`.
+  - `camera_tilt_angle` default `0.1` rad (vendor `0.2618`).
+  - Private params on `/locobot/rtabmap/rtabmap`: `cloud_voxel_size 0.05`,
+    `cloud_max_depth 4.0`, `cloud_decimation 4`, so the live `cloud_map` is
+    light enough for WiFi.
+
+  Registration flags (ICP, `Reg/Strategy 1`, `Reg/Force3DoF`) are copied
+  verbatim.
+- **`scripts/export_3d_map.sh`**: exports a DB to cloud and poses (optional
+  `--mesh`, `--voxel`, `--max-range`, `--out-dir`, `--name`) from a `mktemp`
+  copy cleaned up by `trap`, then runs `cloud_stats.py`.
+- **`scripts/cloud_stats.py`**: reads rtabmap binary PLY with numpy only (no
+  open3d, plyfile, pcl_viewer or CloudCompare on the NUC). Prints point count,
+  extents and a height histogram. It warns when the cloud is **flat**
+  (p99−p1 z < 0.3 m, a lidar-only map) or tops out **below 1.8 m** (camera
+  tilted too far down).
+- **`CMakeLists.txt`**: adds `cloud_stats.py` to `catkin_install_python`, and
+  `export_3d_map.sh` via `install(PROGRAMS)`.
+- **README.md**: new "3D mapping (depth camera)" section; layout table
+  mentions `~/uan_maps`.
+
+Nothing was added to `.gitignore`. All 3D outputs are written to `~/uan_maps`,
+outside the repo, which avoids the size problem without reversing the user's
+choice to track `maps/` and `*.pgm`.
+
+### Bug hit and fixed during the step
+The first version of `uan_slam_3d.launch` failed to parse (`not well-formed
+(invalid token): line 26`). The header comment contained flags written with
+their leading double dash, and **XML comments may not contain a double dash**.
+Rewrote that comment without dashes. A localization check that seemed to pass
+before the fix had only "passed" because the file never parsed, so it was
+rerun afterwards.
+
+### Verification performed
+- `catkin_make`: exit 0, `cloud_stats.py` devel wrapper installed.
+- `roslaunch --args /locobot/rtabmap/rtabmap uan_base_control uan_slam_3d.launch`
+  resolves to `Grid/Sensor 2`, `Grid/3D true`, `Grid/MaxObstacleHeight 2.0`,
+  `Grid/RangeMax 4.0`, `Reg/Strategy 1`, and **0** `FromDepth` occurrences.
+  This confirms the full-arg override replaced the vendor flags instead of
+  being overridden by them.
+- `--delete_db_on_start` count: mapping **1**, `localization:=true` **0**,
+  `fresh_db:=false` **0**.
+- `roslaunch --dump-params`: `database_path /home/locobot/uan_maps/room_3d.db`,
+  the three `cloud_*` params land on `/locobot/rtabmap/rtabmap`, and
+  `localization:=true` flips `Mem/IncrementalMemory` to false and
+  `Mem/InitWMWithAllNodes` to true.
+- `camera_tilt` node publishes `cmd: [0, 0.1]`.
+- `roslaunch --nodes`: base, bridge, `rplidarNode`, realsense, `rgbd_sync`,
+  `points_xyzrgb`, `obstacle_detection`, `rtabmap`, `move_base`, `camera_tilt`.
+- `rosrun uan_base_control export_3d_map.sh` resolves (prints usage, exit 1)
+  and exits 1 on a missing DB. A full run on the backup reproduced the Phase 0
+  result exactly (546,345 points) and fired the low-ceiling warning. Afterwards
+  the backup was unchanged and no temp dir was left in `/tmp`.
+
+### Not yet verified (needs camera + lidar connected)
+- The launch runs on hardware. The `cloud_*` param names were confirmed in the
+  `librtabmap_util_plugins.so` strings, but not yet confirmed to take effect at
+  runtime.
+- D435 at 5000M; colour and aligned depth at about 30 Hz.
+- `/locobot/rtabmap/cloud_map` and `octomap_occupied_space` publish and grow
+  in 3D while driving.
+- rtabmap CPU load with 3D ray tracing on the NUC.
+- A first real `uan_slam_3d` export passes `cloud_stats.py` with no flat or
+  low-ceiling warning.
+
+### Still open
+- Saving the OctoMap `.bt` file (Phase 4): the method is still undecided,
+  `rtabmap-databaseViewer` or installing `octomap_server`.
+
+---
+
+## Step 15 — ROS 2 Galactic port: `uan_base_control_ros2` (2026-09-17)
+
+### Goal
+The LoCoBot also runs ROS 2 Galactic natively (the Create3 base's own stack;
+`bridge.yaml` already showed its topics are plain ROS 2 messages under the
+hood). Port the full `uan_base_control` functionality — base teleop, 2D
+SLAM, 3D SLAM, saved-map navigation, and the laptop-only sim/navigate demo —
+to a native Galactic package, instead of only reaching the base through
+`ros1_bridge`.
+
+### Written from the laptop, no SSH access to the robot this session
+Same constraint as several earlier steps (e.g. Step 3, Step 11) — everything
+here is code-complete and syntax-checked (`python3 -m py_compile` on every
+node and launch file) but **not yet run against the robot's actual Galactic
+install**. The new package's own README has a numbered "Port notes" section
+listing exactly what to verify first; not duplicated here.
+
+### Design decision: separate package + separate workspace, not the same `uan_base_control`
+A ROS 1 catkin package and a ROS 2 ament package can't share one name in a
+workspace that might be built by either `catkin_make` or `colcon build` —
+neither tool understands the other's manifest. New package is named
+`uan_base_control_ros2`, still placed under this repo's `uan_ws/src/` (so
+the two versions sit side by side for reference), but documented as needing
+its own colcon workspace on the robot (e.g. `~/uan_ros2_ws/src/`) rather
+than being built together with the existing catkin `uan_ws`.
+
+### What ported directly vs. what changed
+- **Base control (`velocity_publisher.py`, `teleop_keyboard.py`,
+  `fake_base_sim.py`, `cloud_stats.py`, `export_3d_map.sh`)**: near
+  line-for-line ports (`rclpy` instead of `rospy`; `cloud_stats.py` and
+  `export_3d_map.sh` are unchanged, since neither has a ROS dependency).
+  Talks to `/mobile_base/cmd_vel`/`/mobile_base/odom` directly — these are
+  native Galactic topics on this robot, so no bridge involved for base
+  control at all, unlike the ROS 1 version.
+- **SLAM (`uan_slam.launch.py`, `uan_slam_3d.launch.py`)**: wrap the
+  Galactic branch of `interbotix_xslocobot_nav`, same wrapping pattern as
+  the ROS 1 launches. The 3D SLAM rtabmap flag overrides (`Grid/Sensor 2`,
+  `Grid/3D true`, etc.) carry over unchanged — these are core `rtabmap`
+  library parameter names, not ROS-version-specific.
+- **Navigation (`uan_navigate.launch.py`)**: replaced the ROS 1
+  map_server+amcl+move_base trio with Nav2's `bringup_launch.py`. Wrote a
+  new `config/nav2_params.yaml` from scratch — the vendor's actual
+  costmap/planner values were never available to port even on the ROS 1
+  side (changes.md Step 3 explicitly didn't copy them), so this is a
+  generic, documented-as-such starting config, not a tuned port.
+- **Sim navigate (`uan_sim_navigate.launch.py`)**: same no-hardware design
+  as the ROS 1 version (map_server + static transform + `fake_base_sim` +
+  robot mesh), using Nav2's `navigation_launch.py` (no AMCL — no real scan
+  to localize against here either way).
+
+### Known unresolved mismatch: topic/frame namespacing
+The ROS 1 stack has an inconsistency inherited from the vendor packages:
+TF frames are prefixed `<robot_name>/...` but `move_base`/`amcl` themselves
+run **unnamespaced**, while the lidar scan is namespaced under
+`/<robot_name>/scan` (this is exactly what Step 9's amcl remap worked
+around). The ROS 2 port assumes the same split and bridges it with two
+`topic_tools relay` nodes (`scan` and `cmd_vel`) since ROS 2 launch can't
+remap a topic on a node defined inside an *included* launch file the way
+roslaunch's `<remap>` could. Flagged as unverified in the new package's
+README — first thing to check once `uan_bringup.launch.py` is confirmed
+working on the robot.
+
+### Files created
+`uan_ws/src/uan_base_control_ros2/` — full ament_python package: `package.xml`,
+`setup.py`/`setup.cfg`, `resource/`, four `rclpy` nodes, five `.launch.py`
+files, `config/base_params.yaml` + `config/nav2_params.yaml`,
+`maps/{hall,my_room}.{pgm,yaml}` (copied as-is — the map YAML format is
+identical between ROS 1 `map_server` and ROS 2 `nav2_map_server`),
+`scripts/export_3d_map.sh`, and its own `README.md`.
+
+### Verification performed
+- `python3 -m py_compile` on every node script and launch file — all clean.
+- No hardware, no ROS 2 install available in this session — nothing beyond
+  syntax has been checked. Every vendor-package assumption (launch file
+  names/args for `interbotix_xslocobot_control`/`interbotix_xslocobot_nav`,
+  whether `nav2_bringup` is installed, frame/topic namespacing) is listed
+  as unverified in the package README rather than asserted.
+
+### Still open
+Everything under "Port notes" in `uan_ws/src/uan_base_control_ros2/README.md`
+— this is a first draft to build and iterate on directly on the robot, the
+same way the ROS 1 stack was hardened over Steps 1–14.
+>>>>>>> 2320ec4 (Add ROS 2 Galactic port of uan_base_control (Step 15))
